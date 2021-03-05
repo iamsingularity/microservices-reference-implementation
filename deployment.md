@@ -3,9 +3,9 @@
 ## Prerequisites
 
 - Azure subscription
+  > Important: The user initiating the deployment process must have access to the `Microsoft.Authorization/roleAssignments/write` permission. For more information, please refer to [the Container Insights doc](https://docs.microsoft.com/en-us/azure/azure-monitor/insights/container-insights-troubleshoot#authorization-error-during-onboarding-or-update-operation)
 - [Azure CLI 2.0](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli)
 - [Docker](https://docs.docker.com/)
-- [Helm 2.12.3 or later](https://docs.helm.sh/using_helm/#installing-helm)
 - [JQ](https://stedolan.github.io/jq/download/)
 
 > Note: in linux systems, it is possible to run the docker command without prefacing
@@ -40,6 +40,8 @@ export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export SUBSCRIPTION_NAME=$(az account show --query name --output tsv)
 export TENANT_ID=$(az account show --query tenantId --output tsv)
 
+export DEPLOYMENT_SUFFIX=$(date +%S%N)
+
 export PROJECT_ROOT=./microservices-reference-implementation
 export K8S=$PROJECT_ROOT/k8s
 export HELM_CHARTS=$PROJECT_ROOT/charts
@@ -73,32 +75,38 @@ Infrastructure
 ```bash
 # Deploy the resource groups and managed identities
 # These are deployed first in a separate template to avoid propagation delays with AAD
+export DEV_PREREQ_DEPLOYMENT_NAME=azuredeploy-prereqs-${DEPLOYMENT_SUFFIX}-dev
 az deployment create \
-   --name azuredeploy-prereqs-dev \
+   --name $DEV_PREREQ_DEPLOYMENT_NAME \
    --location $LOCATION \
    --template-file ${PROJECT_ROOT}/azuredeploy-prereqs.json \
    --parameters resourceGroupName=$RESOURCE_GROUP \
                 resourceGroupLocation=$LOCATION
 
-export IDENTITIES_DEPLOYMENT_NAME=$(az deployment show -n azuredeploy-prereqs-dev --query properties.outputs.identitiesDeploymentName.value -o tsv) && \
-export DELIVERY_ID_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEPLOYMENT_NAME --query properties.outputs.deliveryIdName.value -o tsv) && \
+export IDENTITIES_DEV_DEPLOYMENT_NAME=$(az deployment show -n $DEV_PREREQ_DEPLOYMENT_NAME --query properties.outputs.identitiesDeploymentName.value -o tsv) && \
+export DELIVERY_ID_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.deliveryIdName.value -o tsv) && \
 export DELIVERY_ID_PRINCIPAL_ID=$(az identity show -g $RESOURCE_GROUP -n $DELIVERY_ID_NAME --query principalId -o tsv) && \
-export DRONESCHEDULER_ID_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEPLOYMENT_NAME --query properties.outputs.droneSchedulerIdName.value -o tsv) && \
+export DRONESCHEDULER_ID_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.droneSchedulerIdName.value -o tsv) && \
 export DRONESCHEDULER_ID_PRINCIPAL_ID=$(az identity show -g $RESOURCE_GROUP -n $DRONESCHEDULER_ID_NAME --query principalId -o tsv) && \
-export WORKFLOW_ID_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEPLOYMENT_NAME --query properties.outputs.workflowIdName.value -o tsv) && \
+export WORKFLOW_ID_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.workflowIdName.value -o tsv) && \
 export WORKFLOW_ID_PRINCIPAL_ID=$(az identity show -g $RESOURCE_GROUP -n $WORKFLOW_ID_NAME --query principalId -o tsv) && \
-export RESOURCE_GROUP_ACR=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEPLOYMENT_NAME --query properties.outputs.acrResourceGroupName.value -o tsv)
+export GATEWAY_CONTROLLER_ID_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.appGatewayControllerIdName.value -o tsv) && \
+export GATEWAY_CONTROLLER_ID_PRINCIPAL_ID=$(az identity show -g $RESOURCE_GROUP -n $GATEWAY_CONTROLLER_ID_NAME --query principalId -o tsv) && \
+export RESOURCE_GROUP_ACR=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.acrResourceGroupName.value -o tsv)
 
 # Wait for AAD propagation
 until az ad sp show --id ${DELIVERY_ID_PRINCIPAL_ID} &> /dev/null ; do echo "Waiting for AAD propagation" && sleep 5; done
 until az ad sp show --id ${DRONESCHEDULER_ID_PRINCIPAL_ID} &> /dev/null ; do echo "Waiting for AAD propagation" && sleep 5; done
 until az ad sp show --id ${WORKFLOW_ID_PRINCIPAL_ID} &> /dev/null ; do echo "Waiting for AAD propagation" && sleep 5; done
+until az ad sp show --id ${GATEWAY_CONTROLLER_ID_PRINCIPAL_ID} &> /dev/null ; do echo "Waiting for AAD propagation" && sleep 5; done
 
 # Export the kubernetes cluster version
 export KUBERNETES_VERSION=$(az aks get-versions -l $LOCATION --query "orchestrators[?default!=null].orchestratorVersion" -o tsv)
+export SERVICETAGS_LOCATION=$(az account list-locations --query "[?name=='${LOCATION}'].displayName" -o tsv | sed 's/[[:space:]]//g')
 
-# Deploy all other resources
-az group deployment create -g $RESOURCE_GROUP --name azuredeploy-dev --template-file ${PROJECT_ROOT}/azuredeploy.json \
+# Deploy cluster and microservices Azure services
+export DEV_DEPLOYMENT_NAME=azuredeploy-${DEPLOYMENT_SUFFIX}-dev
+az group deployment create -g $RESOURCE_GROUP --name $DEV_DEPLOYMENT_NAME --template-file ${PROJECT_ROOT}/azuredeploy.json \
 --parameters servicePrincipalClientId=${SP_APP_ID} \
             servicePrincipalClientSecret=${SP_CLIENT_SECRET} \
             servicePrincipalId=${SP_OBJECT_ID} \
@@ -110,21 +118,37 @@ az group deployment create -g $RESOURCE_GROUP --name azuredeploy-dev --template-
             droneSchedulerPrincipalId=${DRONESCHEDULER_ID_PRINCIPAL_ID} \
             workflowIdName=${WORKFLOW_ID_NAME} \
             workflowPrincipalId=${WORKFLOW_ID_PRINCIPAL_ID} \
+            appGatewayControllerIdName=${GATEWAY_CONTROLLER_ID_NAME} \
+            appGatewayControllerPrincipalId=${GATEWAY_CONTROLLER_ID_PRINCIPAL_ID} \
             acrResourceGroupName=${RESOURCE_GROUP_ACR} \
             acrResourceGroupLocation=$LOCATION
+
+export VNET_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.aksVNetName.value -o tsv) && \
+export CLUSTER_SUBNET_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.aksClusterSubnetName.value -o tsv) && \
+export CLUSTER_SUBNET_PREFIX=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.aksClusterSubnetPrefix.value -o tsv) && \
+export CLUSTER_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.aksClusterName.value -o tsv) && \
+export CLUSTER_SERVER=$(az aks show -n $CLUSTER_NAME -g $RESOURCE_GROUP --query fqdn -o tsv) && \
+export FIREWALL_PIP_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.firewallPublicIpName.value -o tsv) && \
+export ACR_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.acrName.value -o tsv) && \
+export ACR_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv) && \
+export DELIVERY_REDIS_HOSTNAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.deliveryRedisHostName.value -o tsv)
+
+# Restrict cluster egress traffic
+az group deployment create -g $RESOURCE_GROUP --name azuredeploy-firewall-${DEPLOYMENT_SUFFIX} --template-file ${PROJECT_ROOT}/azuredeploy-firewall.json \
+--parameters aksVnetName=${VNET_NAME} \
+            aksClusterSubnetName=${CLUSTER_SUBNET_NAME} \
+            aksClusterSubnetPrefix=${CLUSTER_SUBNET_PREFIX} \
+            firewallPublicIpName=${FIREWALL_PIP_NAME} \
+            serviceTagsLocation=${SERVICETAGS_LOCATION} \
+            aksFqdns="['${CLUSTER_SERVER}']" \
+            acrServers="['${ACR_SERVER}']" \
+            deliveryRedisHostNames="['${DELIVERY_REDIS_HOSTNAME}']"
 ```
 
 Get outputs from Azure Deploy
 ```bash
 # Shared
-export ACR_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.acrName.value -o tsv) && \
-export ACR_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv) && \
-export CLUSTER_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.aksClusterName.value -o tsv)
-```
-
-Enable Azure Monitoring for the AKS cluster
-```bash
-az aks enable-addons -a monitoring --resource-group=$RESOURCE_GROUP --name=$CLUSTER_NAME
+export GATEWAY_SUBNET_PREFIX=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.appGatewaySubnetPrefix.value -o tsv)
 ```
 
 Download kubectl and create a k8s namespace
@@ -139,18 +163,18 @@ az aks get-credentials --resource-group=$RESOURCE_GROUP --name=$CLUSTER_NAME
 kubectl create namespace backend-dev
 ```
 
-Setup Helm in the container
+Setup Helm
 
 ```bash
-kubectl apply -f $K8S/tiller-rbac.yaml
-helm init --service-account tiller
+# install helm CLI
+curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
 ```
 
 Integrate Application Insights instance
 
 ```bash
 # Acquire Instrumentation Key
-export AI_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.appInsightsName.value -o tsv)
+export AI_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.appInsightsName.value -o tsv)
 export AI_IKEY=$(az resource show \
                     -g $RESOURCE_GROUP \
                     -n $AI_NAME \
@@ -170,28 +194,53 @@ Note: the tested nmi version was 1.4. It enables namespaced pod identity.
 
 ```bash
 # setup AAD pod identity
-kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment-rbac.yaml
+helm repo add aad-pod-identity https://raw.githubusercontent.com/Azure/aad-pod-identity/master/charts && \
+helm install aad-pod-identity aad-pod-identity/aad-pod-identity -n kube-system
 
 kubectl create -f https://raw.githubusercontent.com/Azure/kubernetes-keyvault-flexvol/master/deployment/kv-flexvol-installer.yaml
 ```
 
-## Deploy the ingress controller
+## Deploy the ingress controllers
+
+> :warning: WARNING
+>
+> Do not use the certificates created by these scripts for production. The
+> certificates are provided for demonstration purposes only.
+> For your production cluster, use your
+> security best practices for digital certificates creation and lifetime management.
 
 ```bash
-# Deploy the ngnix ingress controller
-helm install stable/nginx-ingress --name nginx-ingress-dev --namespace ingress-controllers --set rbac.create=true --set controller.ingressClass=nginx-dev
+# Deploy the AppGateway ingress controller
+helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
+helm repo update
 
-# Obtain the load balancer ip address and assign a domain name
-until export INGRESS_LOAD_BALANCER_IP=$(kubectl get services/nginx-ingress-dev-controller -n ingress-controllers -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2> /dev/null) && test -n "$INGRESS_LOAD_BALANCER_IP"; do echo "Waiting for load balancer deployment" && sleep 20; done
-export INGRESS_LOAD_BALANCER_IP_ID=$(az network public-ip list --query "[?ipAddress!=null]|[?contains(ipAddress, '$INGRESS_LOAD_BALANCER_IP')].[id]" --output tsv)
-export EXTERNAL_INGEST_DNS_NAME="${RESOURCE_GROUP}-ingest-dev"
-export EXTERNAL_INGEST_FQDN=$(az network public-ip update --ids $INGRESS_LOAD_BALANCER_IP_ID --dns-name $EXTERNAL_INGEST_DNS_NAME --query "dnsSettings.fqdn" --output tsv)
+export GATEWAY_CONTROLLER_PRINCIPAL_RESOURCE_ID=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.appGatewayControllerPrincipalResourceId.value -o tsv) && \
+export GATEWAY_CONTROLLER_PRINCIPAL_CLIENT_ID=$(az identity show -g $RESOURCE_GROUP -n $GATEWAY_CONTROLLER_ID_NAME --query clientId -o tsv)
+export APP_GATEWAY_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.appGatewayName.value -o tsv)
+export APP_GATEWAY_PUBLIC_IP_FQDN=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.appGatewayPublicIpFqdn.value -o tsv)
+
+helm install ingress-azure-dev application-gateway-kubernetes-ingress/ingress-azure \
+     --namespace kube-system \
+     --set appgw.name=$APP_GATEWAY_NAME \
+     --set appgw.resourceGroup=$RESOURCE_GROUP \
+     --set appgw.subscriptionId=$SUBSCRIPTION_ID \
+     --set appgw.shared=false \
+     --set kubernetes.watchNamespace=backend-dev \
+     --set armAuth.type=aadPodIdentity \
+     --set armAuth.identityResourceID=$GATEWAY_CONTROLLER_PRINCIPAL_RESOURCE_ID \
+     --set armAuth.identityClientID=$GATEWAY_CONTROLLER_PRINCIPAL_CLIENT_ID \
+     --set rbac.enabled=true \
+     --set verbosityLevel=3 \
+     --set aksClusterConfiguration.apiServerAddress=$CLUSTER_SERVER \
+     --set appgw.usePrivateIP=false \
+     --version 1.2.0-rc2
 
 # Create a self-signed certificate for TLS
+export EXTERNAL_INGEST_FQDN=$APP_GATEWAY_PUBLIC_IP_FQDN
 openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -out ingestion-ingress-tls.crt \
     -keyout ingestion-ingress-tls.key \
-    -subj "/CN=${EXTERNAL_INGEST_FQDN}/O=fabrikam"
+    -subj "/CN=${APP_GATEWAY_PUBLIC_IP_FQDN}/O=fabrikam"
 ```
 
 ## Setup cluster resource quota
@@ -200,15 +249,21 @@ openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
 kubectl apply -f $K8S/k8s-resource-quotas-dev.yaml
 ```
 
+## Deny all ingress and egress traffic
+
+```bash
+kubectl apply -f $K8S/k8s-deny-all-non-whitelisted-traffic-dev.yaml
+```
+
 ## Deploy the Delivery service
 
 Extract resource details from deployment
 
 ```bash
-export COSMOSDB_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.deliveryCosmosDbName.value -o tsv) && \
+export COSMOSDB_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.deliveryCosmosDbName.value -o tsv) && \
 export DATABASE_NAME="${COSMOSDB_NAME}-db" && \
 export COLLECTION_NAME="${DATABASE_NAME}-col" && \
-export DELIVERY_KEYVAULT_URI=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.deliveryKeyVaultUri.value -o tsv)
+export DELIVERY_KEYVAULT_URI=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.deliveryKeyVaultUri.value -o tsv)
 ```
 
 Build the Delivery service
@@ -232,12 +287,13 @@ Deploy the Delivery service:
 
 ```bash
 # Extract pod identity outputs from deployment
-export DELIVERY_PRINCIPAL_RESOURCE_ID=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEPLOYMENT_NAME --query properties.outputs.deliveryPrincipalResourceId.value -o tsv) && \
+export DELIVERY_PRINCIPAL_RESOURCE_ID=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.deliveryPrincipalResourceId.value -o tsv) && \
 export DELIVERY_PRINCIPAL_CLIENT_ID=$(az identity show -g $RESOURCE_GROUP -n $DELIVERY_ID_NAME --query clientId -o tsv)
 export DELIVERY_INGRESS_TLS_SECRET_NAME=delivery-ingress-tls
 
 # Deploy the service
-helm install $HELM_CHARTS/delivery/ \
+helm package $HELM_CHARTS/delivery/ -u && \
+helm install delivery-v0.1.0-dev delivery-v0.1.0.tgz \
      --set image.tag=0.1.0 \
      --set image.repository=delivery \
      --set dockerregistry=$ACR_SERVER \
@@ -248,19 +304,21 @@ helm install $HELM_CHARTS/delivery/ \
      --set ingress.tls.secrets[0].name=$DELIVERY_INGRESS_TLS_SECRET_NAME \
      --set ingress.tls.secrets[0].key="$(cat ingestion-ingress-tls.key)" \
      --set ingress.tls.secrets[0].certificate="$(cat ingestion-ingress-tls.crt)" \
+     --set networkPolicy.egress.external.enabled=true \
+     --set networkPolicy.egress.external.clusterSubnetPrefix=$CLUSTER_SUBNET_PREFIX \
+     --set networkPolicy.ingress.externalSubnet.enabled=true \
+     --set networkPolicy.ingress.externalSubnet.subnetPrefix=$GATEWAY_SUBNET_PREFIX \
      --set identity.clientid=$DELIVERY_PRINCIPAL_CLIENT_ID \
      --set identity.resourceid=$DELIVERY_PRINCIPAL_RESOURCE_ID \
      --set cosmosdb.id=$DATABASE_NAME \
      --set cosmosdb.collectionid=$COLLECTION_NAME \
      --set keyvault.uri=$DELIVERY_KEYVAULT_URI \
      --set reason="Initial deployment" \
-     --set tags.dev=true \
-     --namespace backend-dev \
-     --name delivery-v0.1.0-dev \
-     --dep-up
+     --set envs.dev=true \
+     --namespace backend-dev
 
 # Verify the pod is created
-helm status delivery-v0.1.0-dev
+helm status delivery-v0.1.0-dev --namespace backend-dev
 ```
 
 ## Deploy the Package service
@@ -268,7 +326,7 @@ helm status delivery-v0.1.0-dev
 Extract resource details from deployment
 
 ```bash
-export COSMOSDB_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.packageMongoDbName.value -o tsv)
+export COSMOSDB_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.packageMongoDbName.value -o tsv)
 ```
 
 Build the Package service
@@ -293,24 +351,25 @@ export COSMOSDB_CONNECTION=$(az cosmosdb list-connection-strings --name $COSMOSD
 export COSMOSDB_COL_NAME=packages
 
 # Deploy service
-helm install $HELM_CHARTS/package/ \
+helm package $HELM_CHARTS/package/ -u && \
+helm install package-v0.1.0-dev package-v0.1.0.tgz \
      --set image.tag=0.1.0 \
      --set image.repository=package \
      --set ingress.hosts[0].name=$EXTERNAL_INGEST_FQDN \
      --set ingress.hosts[0].serviceName=package \
      --set ingress.hosts[0].tls=false \
+     --set networkPolicy.egress.external.enabled=true \
+     --set networkPolicy.egress.external.clusterSubnetPrefix=$CLUSTER_SUBNET_PREFIX \
      --set secrets.appinsights.ikey=$AI_IKEY \
      --set secrets.mongo.pwd=$COSMOSDB_CONNECTION \
      --set cosmosDb.collectionName=$COSMOSDB_COL_NAME \
      --set dockerregistry=$ACR_SERVER \
      --set reason="Initial deployment" \
-     --set tags.dev=true \
-     --namespace backend-dev \
-     --name package-v0.1.0-dev \
-     --dep-up
+     --set envs.dev=true \
+     --namespace backend-dev
 
 # Verify the pod is created
-helm status package-v0.1.0-dev
+helm status package-v0.1.0-dev --namespace backend-dev
 ```
 
 ## Deploy the Workflow service
@@ -318,7 +377,7 @@ helm status package-v0.1.0-dev
 Extract resource details from deployment
 
 ```bash
-export WORKFLOW_KEYVAULT_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.workflowKeyVaultName.value -o tsv)
+export WORKFLOW_KEYVAULT_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.workflowKeyVaultName.value -o tsv)
 ```
 
 Build the workflow service
@@ -338,7 +397,7 @@ Create and set up pod identity
 
 ```bash
 # Extract outputs from deployment
-export WORKFLOW_PRINCIPAL_RESOURCE_ID=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEPLOYMENT_NAME --query properties.outputs.workflowPrincipalResourceId.value -o tsv) && \
+export WORKFLOW_PRINCIPAL_RESOURCE_ID=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.workflowPrincipalResourceId.value -o tsv) && \
 export WORKFLOW_PRINCIPAL_CLIENT_ID=$(az identity show -g $RESOURCE_GROUP -n $WORKFLOW_ID_NAME --query clientId -o tsv)
 ```
 
@@ -346,24 +405,25 @@ Deploy the Workflow service:
 
 ```bash
 # Deploy the service
-helm install $HELM_CHARTS/workflow/ \
+helm package $HELM_CHARTS/workflow/ -u && \
+helm install workflow-v0.1.0-dev workflow-v0.1.0.tgz \
      --set image.tag=0.1.0 \
      --set image.repository=workflow \
      --set dockerregistry=$ACR_SERVER \
      --set identity.clientid=$WORKFLOW_PRINCIPAL_CLIENT_ID \
      --set identity.resourceid=$WORKFLOW_PRINCIPAL_RESOURCE_ID \
+     --set networkPolicy.egress.external.enabled=true \
+     --set networkPolicy.egress.external.clusterSubnetPrefix=$CLUSTER_SUBNET_PREFIX \
      --set keyvault.name=$WORKFLOW_KEYVAULT_NAME \
      --set keyvault.resourcegroup=$RESOURCE_GROUP \
      --set keyvault.subscriptionid=$SUBSCRIPTION_ID \
      --set keyvault.tenantid=$TENANT_ID \
      --set reason="Initial deployment" \
-     --set tags.dev=true \
-     --namespace backend-dev \
-     --name workflow-v0.1.0-dev \
-     --dep-up
+     --set envs.dev=true \
+     --namespace backend-dev
 
 # Verify the pod is created
-helm status workflow-v0.1.0-dev
+helm status workflow-v0.1.0-dev --namespace backend-dev
 ```
 
 ## Deploy the Ingestion service
@@ -371,9 +431,9 @@ helm status workflow-v0.1.0-dev
 Extract resource details from deployment
 
 ```bash
-export INGESTION_QUEUE_NAMESPACE=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.ingestionQueueNamespace.value -o tsv) && \
-export INGESTION_QUEUE_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.ingestionQueueName.value -o tsv)
-export INGESTION_ACCESS_KEY_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.ingestionServiceAccessKeyName.value -o tsv)
+export INGESTION_QUEUE_NAMESPACE=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.ingestionQueueNamespace.value -o tsv) && \
+export INGESTION_QUEUE_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.ingestionQueueName.value -o tsv)
+export INGESTION_ACCESS_KEY_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.ingestionServiceAccessKeyName.value -o tsv)
 export INGESTION_ACCESS_KEY_VALUE=$(az servicebus namespace authorization-rule keys list --resource-group $RESOURCE_GROUP --namespace-name $INGESTION_QUEUE_NAMESPACE --name $INGESTION_ACCESS_KEY_NAME --query primaryKey -o tsv)
 ```
 
@@ -397,7 +457,8 @@ Deploy the Ingestion service
 export INGRESS_TLS_SECRET_NAME=ingestion-ingress-tls
 
 # Deploy service
-helm install $HELM_CHARTS/ingestion/ \
+helm package $HELM_CHARTS/ingestion/ -u && \
+helm install ingestion-v0.1.0-dev ingestion-v0.1.0.tgz \
      --set image.tag=0.1.0 \
      --set image.repository=ingestion \
      --set dockerregistry=$ACR_SERVER \
@@ -408,19 +469,21 @@ helm install $HELM_CHARTS/ingestion/ \
      --set ingress.tls.secrets[0].name=$INGRESS_TLS_SECRET_NAME \
      --set ingress.tls.secrets[0].key="$(cat ingestion-ingress-tls.key)" \
      --set ingress.tls.secrets[0].certificate="$(cat ingestion-ingress-tls.crt)" \
+     --set networkPolicy.egress.external.enabled=true \
+     --set networkPolicy.egress.external.clusterSubnetPrefix=$CLUSTER_SUBNET_PREFIX \
+     --set networkPolicy.ingress.externalSubnet.enabled=true \
+     --set networkPolicy.ingress.externalSubnet.subnetPrefix=$GATEWAY_SUBNET_PREFIX \
      --set secrets.appinsights.ikey=${AI_IKEY} \
      --set secrets.queue.keyname=IngestionServiceAccessKey \
      --set secrets.queue.keyvalue=${INGESTION_ACCESS_KEY_VALUE} \
      --set secrets.queue.name=${INGESTION_QUEUE_NAME} \
      --set secrets.queue.namespace=${INGESTION_QUEUE_NAMESPACE} \
      --set reason="Initial deployment" \
-     --set tags.dev=true \
-     --namespace backend-dev \
-     --name ingestion-v0.1.0-dev \
-     --dep-up
+     --set envs.dev=true \
+     --namespace backend-dev
 
 # Verify the pod is created
-helm status ingestion-v0.1.0-dev
+helm status ingestion-v0.1.0-dev --namespace backend-dev
 ```
 
 ## Deploy DroneScheduler service
@@ -428,8 +491,8 @@ helm status ingestion-v0.1.0-dev
 Extract resource details from deployment
 
 ```bash
-export DRONESCHEDULER_KEYVAULT_URI=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.droneSchedulerKeyVaultUri.value -o tsv)
-export DRONESCHEDULER_COSMOSDB_NAME=$(az group deployment show -g $RESOURCE_GROUP -n azuredeploy-dev --query properties.outputs.droneSchedulerCosmosDbName.value -o tsv) && \
+export DRONESCHEDULER_KEYVAULT_URI=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.droneSchedulerKeyVaultUri.value -o tsv)
+export DRONESCHEDULER_COSMOSDB_NAME=$(az group deployment show -g $RESOURCE_GROUP -n $DEV_DEPLOYMENT_NAME --query properties.outputs.droneSchedulerCosmosDbName.value -o tsv) && \
 export ENDPOINT_URL=$(az cosmosdb show -n $DRONESCHEDULER_COSMOSDB_NAME -g $RESOURCE_GROUP --query documentEndpoint -o tsv) && \
 export AUTH_KEY=$(az cosmosdb list-keys -n $DRONESCHEDULER_COSMOSDB_NAME -g $RESOURCE_GROUP --query primaryMasterKey -o tsv) && \
 export DATABASE_NAME="invoicing" && \
@@ -446,7 +509,7 @@ Create and set up pod identity
 
 ```bash
 # Extract outputs from deployment
-export DRONESCHEDULER_PRINCIPAL_RESOURCE_ID=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEPLOYMENT_NAME --query properties.outputs.droneSchedulerPrincipalResourceId.value -o tsv) && \
+export DRONESCHEDULER_PRINCIPAL_RESOURCE_ID=$(az group deployment show -g $RESOURCE_GROUP -n $IDENTITIES_DEV_DEPLOYMENT_NAME --query properties.outputs.droneSchedulerPrincipalResourceId.value -o tsv) && \
 export DRONESCHEDULER_PRINCIPAL_CLIENT_ID=$(az identity show -g $RESOURCE_GROUP -n $DRONESCHEDULER_ID_NAME --query clientId -o tsv)
 ```
 
@@ -464,7 +527,8 @@ docker push $ACR_SERVER/dronescheduler:0.1.0
 Deploy the dronescheduler service:
 ```bash
 # Deploy the service
-helm install $HELM_CHARTS/dronescheduler/ \
+helm package $HELM_CHARTS/dronescheduler/ -u && \
+helm install dronescheduler-v0.1.0-dev dronescheduler-v0.1.0.tgz \
      --set image.tag=0.1.0 \
      --set image.repository=dronescheduler \
      --set dockerregistry=$ACR_SERVER \
@@ -473,17 +537,17 @@ helm install $HELM_CHARTS/dronescheduler/ \
      --set ingress.hosts[0].tls=false \
      --set identity.clientid=$DRONESCHEDULER_PRINCIPAL_CLIENT_ID \
      --set identity.resourceid=$DRONESCHEDULER_PRINCIPAL_RESOURCE_ID \
+     --set networkPolicy.egress.external.enabled=true \
+     --set networkPolicy.egress.external.clusterSubnetPrefix=$CLUSTER_SUBNET_PREFIX \
      --set keyvault.uri=$DRONESCHEDULER_KEYVAULT_URI \
      --set cosmosdb.id=$DATABASE_NAME \
      --set cosmosdb.collectionid=$COLLECTION_NAME \
      --set reason="Initial deployment" \
-     --set tags.dev=true \
-     --namespace backend-dev \
-     --name dronescheduler-v0.1.0-dev \
-     --dep-up
+     --set envs.dev=true \
+     --namespace backend-dev
 
 # Verify the pod is created
-helm status dronescheduler-v0.1.0-dev
+helm status dronescheduler-v0.1.0-dev --namespace backend-dev
 ```
 
 ## Validate the application is running
@@ -495,10 +559,9 @@ You can send delivery requests and check their statuses using curl.
 Since the certificate used for TLS is self-signed, the request disables TLS validation using the '-k' option.
 
 ```bash
-curl -X POST "https://$EXTERNAL_INGEST_FQDN/api/deliveryrequests" --header 'Content-Type: application/json' --header 'Accept: application/json' -k -i -d '{
+curl -X POST "https://$EXTERNAL_INGEST_FQDN/api/deliveryrequests" --header 'Content-Type: application/json' --header 'Accept: application/json' -k -d '{
    "confirmationRequired": "None",
    "deadline": "",
-   "deliveryId": "mydelivery",
    "dropOffLocation": "drop off",
    "expedited": true,
    "ownerId": "myowner",
@@ -510,20 +573,16 @@ curl -X POST "https://$EXTERNAL_INGEST_FQDN/api/deliveryrequests" --header 'Cont
    },
    "pickupLocation": "my pickup",
    "pickupTime": "2019-05-08T20:00:00.000Z"
- }'
+ }' > deliveryresponse.json
 ```
 
 ### Check the request status
-
 ```bash
-curl "https://$EXTERNAL_INGEST_FQDN/api/deliveries/mydelivery" --header 'Accept: application/json' -k -i
+DELIVERY_ID=$(cat deliveryresponse.json | jq -r .deliveryId)
+curl "https://$EXTERNAL_INGEST_FQDN/api/deliveries/$DELIVERY_ID" --header 'Accept: application/json' -k
 ```
 
 ## Optional steps
-
-### Load Test the application
-
-To run load testing against the solution, follow the steps listed [here](./src/loadtests/readme.md).
 
 ### Fluentd and Elastic Search
 
@@ -551,4 +610,18 @@ sed -i 's/  value: "elastic"/#  value: "elastic"/' fluentd-daemonset-elasticsear
 sed -i "s/- name: FLUENT_ELASTICSEARCH_PASSWORD/#- name: FLUENT_ELASTICSEARCH_PASSWORD/" fluentd-daemonset-elasticsearch.yaml && \
 sed -i 's/  value: "changeme"/#  value: "changeme"/' fluentd-daemonset-elasticsearch.yaml && \
 kubectl --namespace kube-system apply -f fluentd-daemonset-elasticsearch.yaml
+```
+
+## Clean up
+
+Follow the steps below to remove the Fabrikam Drone Delivery app from your cluster
+
+```bash
+helm uninstall $(helm ls --all --short -n ingress-controllers)  -n ingress-controllers && \
+helm uninstall $(helm ls --all --short -n backend-dev)  -n backend-dev
+
+# if you've choosen the CI/CD path
+helm uninstall $(helm ls --all --short -n backend-qa)  -n backend-qa && \
+helm uninstall $(helm ls --all --short -n backend-staging)  -n backend-staging && \
+helm uninstall $(helm ls --all --short -n backend-prod)  -n backend-prod
 ```

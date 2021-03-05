@@ -1,20 +1,34 @@
 # Default values for delivery.
 nameOverride: delivery
+
+
 replicaCount: 1
+
+
 identity:
   clientid:
   resourceid:
+
+
 dockerregistrynamespace:
 dockerregistry:
+
+
 image:
   repository:
   tag:
   pullPolicy: IfNotPresent
+
+
 cosmosdb:
   id:
   collectionid:
+
 keyvault:
   uri:
+
+
+# probes
 readinessProbe:
   httpGet:
     path: /healthz
@@ -29,12 +43,51 @@ livenessProbe:
     port: 8080
   initialDelaySeconds: 50
   periodSeconds: 15
+
+
 telemetry:
   level: "Error"
+
+
+# specify an installation/upgrade reason
 reason: unknown
-tags:
+
+
+# indicate what environment is meant to be installed/upgraded
+envs:
   dev: false
   prod: false
   qa: false
   staging: false
+
+
 current: false
+
+
+# Horizontal Pod Autoscaling
+autoscaling:
+  enabled: false
+  maxReplicas:
+  minReplicas:
+  targetCPUUtilizationPercentage:
+
+
+# Pod-to-pod traffic: east-west
+networkPolicy:
+  egress:
+    enabled: true
+    allowAll: false
+    external:
+      enabled: false
+      clusterSubnetPrefix:
+  ingress:
+    enabled: true
+    allowAll: false
+    externalSubnet:
+      enabled: false
+      subnetPrefix:
+
+
+service:
+  targetPort: 8080
+  targetProtocol: TCP

@@ -7,7 +7,7 @@
 # Dronescheduler
 ###################################################################################################
 {{- $fullname := include "dronescheduler.fullname" . | replace "." "" }}
-apiVersion: apps/v1beta2
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $fullname }}
@@ -96,6 +96,6 @@ spec:
           value: {{ default "Error" .Values.telemetry.level | quote }}
         - name: no_proxy
           value: 169.254.169.254
-      ports:
-        - name: service
-          containerPort: 8080
+        ports:
+          - name: service
+            containerPort: 8080
